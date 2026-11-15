@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { clearLinkMigrationState, deleteStoredLinks, expectStoredHashedPassword, fetch, fetchWithAuth, getStoredLink, setLinkStoreD1Mode } from '../utils'
+import { clearLinkMigrationState, deleteStoredLinks, expectStoredHashedPassword, fetch, fetchWithAuth, getStoredLink, setLinkStoreD1Mode, TEST_PNG_BYTES } from '../utils'
 
 const MCP_PATH = '/api/mcp'
 const PROTOCOL_VERSION = '2025-11-25'
@@ -397,5 +397,116 @@ describe('/api/mcp slug isolation', () => {
     expect(redirect.headers.get('location')).toBe('https://example.com/slug-isolation')
 
     expect((await postRpc(1, 'tools/list')).status).toBe(200)
+  })
+})
+
+describe('/api/mcp extended tools', () => {
+  it('reports the credential identity through verify', async () => {
+    const { response, payload } = await callTool('verify', {})
+    expect(response.status).toBe(200)
+    expect(payload.error).toBeUndefined()
+    expect(payload.result?.structuredContent).toMatchObject({ name: 'Sink', authMethod: 'site-token' })
+  })
+
+  it('reports migration status independently of the link-store gate', async () => {
+    const { payload } = await callTool('migration_status', {})
+    expect(payload.result?.structuredContent).toMatchObject({ completed: true })
+  })
+
+  it('exports stored links in an export envelope', async () => {
+    const slug = trackSlug(`mcp-export-${crypto.randomUUID()}`)
+    await callTool('create_link', { url: 'https://example.com/export', slug })
+
+    const { payload } = await callTool('export_links', { status: 'all' })
+    const data = payload.result?.structuredContent as { version: string, links: { slug: string }[] }
+
+    expect(data.version).toBe('1.0')
+    expect(data.links.some(link => link.slug === slug)).toBe(true)
+  })
+
+  it('imports links, then skips the same payload on a second run', async () => {
+    const slug = trackSlug(`mcp-import-${crypto.randomUUID()}`)
+    const body = { version: '1.0', links: [{ url: 'https://example.com/imported', slug }] }
+
+    const first = await callTool('import_links', body)
+    expect(first.payload.result?.structuredContent).toMatchObject({ success: 1, skipped: 0, failed: 0 })
+
+    const second = await callTool('import_links', body)
+    expect(second.payload.result?.structuredContent).toMatchObject({ success: 0, skipped: 1, failed: 0 })
+  })
+
+  it('stores a base64 image and returns a servable asset url', async () => {
+    const slug = `mcp-upload-${crypto.randomUUID()}`
+    const contentBase64 = btoa(String.fromCharCode(...Array.from(TEST_PNG_BYTES)))
+
+    const { payload } = await callTool('upload_image', { slug, filename: 'test.png', contentType: 'image/png', contentBase64 })
+    const data = payload.result?.structuredContent as { url: string, key: string }
+
+    expect(data.url).toBe(`/_assets/${data.key}`)
+    expect(data.key).toMatch(new RegExp(`^images/${slug}/[a-z0-9]+\\.png$`))
+
+    try {
+      const asset = await fetch(data.url)
+      expect(asset.status).toBe(200)
+      expect(new Uint8Array(await asset.arrayBuffer())).toEqual(TEST_PNG_BYTES)
+    }
+    finally {
+      await env.R2.delete(data.key)
+    }
+  })
+
+  it('rejects an unsupported image content type', async () => {
+    const { payload } = await callTool('upload_image', {
+      slug: `mcp-upload-${crypto.randomUUID()}`,
+      filename: 'notes.txt',
+      contentType: 'text/plain',
+      contentBase64: btoa('not an image'),
+    })
+
+    // A schema rejection may surface as an MCP error result or a JSON-RPC error.
+    expect(payload.result?.isError ?? payload.error).toBeTruthy()
+  })
+
+  it('backs links up to R2', async () => {
+    const { payload } = await callTool('backup_links', {})
+    expect(payload.result?.structuredContent).toMatchObject({ success: true })
+  })
+
+  it('falls back to a URL-derived slug when Workers AI fails', async () => {
+    const runSpy = vi.spyOn(env.AI, 'run').mockRejectedValue(new Error('Workers AI unavailable'))
+    const toMarkdownSpy = vi.spyOn(env.AI, 'toMarkdown').mockRejectedValue(new Error('Markdown conversion unavailable'))
+
+    try {
+      const { payload } = await callTool('generate_slug', { url: 'https://example.com/my-post' })
+      expect(payload.result?.structuredContent).toMatchObject({ slug: 'my-post' })
+    }
+    finally {
+      runSpy.mockRestore()
+      toMarkdownSpy.mockRestore()
+    }
+  })
+
+  it('falls back to hostname metadata when Workers AI fails', async () => {
+    const runSpy = vi.spyOn(env.AI, 'run').mockRejectedValue(new Error('Workers AI unavailable'))
+    const toMarkdownSpy = vi.spyOn(env.AI, 'toMarkdown').mockRejectedValue(new Error('Markdown conversion unavailable'))
+
+    try {
+      const { payload } = await callTool('generate_og_metadata', { url: 'https://www.example.com/page' })
+      expect(payload.result?.structuredContent).toMatchObject({ title: 'example.com' })
+    }
+    finally {
+      runSpy.mockRestore()
+      toMarkdownSpy.mockRestore()
+    }
+  })
+
+  it('lists every tool it advertises', async () => {
+    const response = await postRpc(1, 'tools/list')
+    const payload = await readEnvelope(response)
+    const names = (payload.result?.tools as { name: string }[]).map(tool => tool.name)
+
+    for (const expected of ['import_links', 'export_links', 'generate_slug', 'generate_og_metadata', 'upload_image', 'backup_links', 'migration_status', 'verify']) {
+      expect(names).toContain(expected)
+    }
   })
 })

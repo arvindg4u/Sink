@@ -2,6 +2,7 @@ import type { CallToolResult, McpServer, StandardSchemaWithJSON, ToolAnnotations
 import type { H3Event } from 'h3'
 import { createError, isError } from 'h3'
 import { z } from 'zod'
+import { ImportDataSchema } from '#shared/schemas/import'
 import {
   CreateLinkSchema,
   DeleteLinkSchema,
@@ -9,10 +10,14 @@ import {
   LinkFilterQuerySchema,
   LinkSlugQuerySchema,
   ListLinksQuerySchema,
+  nanoid,
   SearchLinksQuerySchema,
+  SlugSchema,
 } from '#shared/schemas/link'
 import { LinkCheckRequestSchema } from '#shared/schemas/link-check'
 import { FilterQuerySchema } from '#shared/schemas/query'
+import { IMAGE_ALLOWED_TYPES, IMAGE_MAX_SIZE } from '#shared/utils/image'
+import { generateLinkOgMetadata, generateLinkSlug } from '../../utils/ai-generate'
 import {
   buildCountersQuery,
   buildHeatmapQuery,
@@ -22,12 +27,16 @@ import {
   MetricsQuerySchema,
   ViewsQuerySchema,
 } from '../../utils/analytics-queries'
+import { backupLinksToR2 } from '../../utils/backup'
 import { useWAE } from '../../utils/cloudflare'
+import { bulkExportLinks, bulkImportLinks, ExportLinksQuerySchema } from '../../utils/link-bulk'
 import { checkLinksPage } from '../../utils/link-check'
 import { sanitizeLinkPassword, sanitizeLinksPassword } from '../../utils/link-password'
 import { removeLink, replaceLink, saveNewLink, upsertLink } from '../../utils/link-processing'
 import { countLinks, getLinkWithMetadata, listLinks, listTags, normalizeSlug, searchLinks } from '../../utils/link-store'
-import { assertLinkStoreReady } from '../link-store/migration'
+import { requireR2Bucket } from '../../utils/r2'
+import { buildVerificationResponse } from '../../utils/verify'
+import { assertLinkStoreReady, readCompletedLinkMigrationMarker } from '../link-store/migration'
 
 interface McpToolDefinition {
   name: string
@@ -155,6 +164,24 @@ const linkTools: McpToolDefinition[] = [
       return { slug: args.slug, deleted: true }
     },
   }),
+  defineTool({
+    name: 'import_links',
+    description: 'Import links from an export payload. A slug that already exists is skipped rather than overwritten, so re-importing the same export is safe. Reports per-link success, skipped, and failed counts with the reason for each failure.',
+    inputSchema: ImportDataSchema,
+    annotations: { destructiveHint: false, idempotentHint: true },
+    handler(event, args) {
+      return bulkImportLinks(event, args)
+    },
+  }),
+  defineTool({
+    name: 'export_links',
+    description: 'Export stored links page by page, newest first, with password protection masked. Follow the returned `cursor` for the next page; `list_complete` marks the last one.',
+    inputSchema: ExportLinksQuerySchema,
+    annotations: { readOnlyHint: true },
+    handler(event, args) {
+      return bulkExportLinks(event, args)
+    },
+  }),
 ]
 
 const analyticsTools: McpToolDefinition[] = [
@@ -196,6 +223,130 @@ const analyticsTools: McpToolDefinition[] = [
   }),
 ]
 
+/** Decodes a base64 image payload, rejecting anything that is not valid base64. */
+function decodeBase64Image(value: string): Uint8Array {
+  let binary: string
+  try {
+    binary = atob(value)
+  }
+  catch {
+    throw createError({ status: 400, statusText: 'contentBase64 is not valid base64' })
+  }
+
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++)
+    bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+
+/**
+ * Tools that reach the link store only indirectly, or not at all. The REST
+ * equivalents live outside the link-store middleware gate, so these are not
+ * registered as link tools and stay callable while the KV-to-D1 migration is
+ * pending — `migration_status` in particular must answer in that state.
+ */
+const utilityTools: McpToolDefinition[] = [
+  defineTool({
+    name: 'generate_slug',
+    description: 'Ask Workers AI for a short slug derived from the page at a URL. Falls back to a slug built from the URL path when the model fails or returns nothing, so it always answers. Requires Workers AI to be bound.',
+    inputSchema: z.object({
+      url: z.url().describe('The URL to generate a slug for.'),
+    }),
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    handler(event, args) {
+      return generateLinkSlug(event, args.url)
+    },
+  }),
+  defineTool({
+    name: 'generate_og_metadata',
+    description: 'Ask Workers AI for a link-preview title and description read from the page at a URL, in the requested locale when the model supports it. Falls back to hostname-derived metadata. Requires Workers AI to be bound.',
+    inputSchema: z.object({
+      url: z.url().describe('The URL to generate preview metadata for.'),
+      locale: z.string().optional().describe('Preferred locale for the generated text, for example en or zh-CN.'),
+    }),
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    handler(event, args) {
+      return generateLinkOgMetadata(event, args.url, args.locale)
+    },
+  }),
+  defineTool({
+    name: 'upload_image',
+    description: `Store an image in R2 for use as a link preview image, and return the /_assets/... URL to pass to create_link or update_link. Supply the bytes as base64. Allowed types: ${IMAGE_ALLOWED_TYPES.join(', ')}, up to 5 MB. Requires the R2 binding.`,
+    inputSchema: z.object({
+      slug: SlugSchema.describe('Slug of the link this image belongs to.'),
+      filename: z.string().trim().min(1).max(255).describe('Original file name, used only for reporting.'),
+      contentType: z.string()
+        .refine(
+          (value): boolean => (IMAGE_ALLOWED_TYPES as readonly string[]).includes(value),
+          { message: `Unsupported image type. Allowed: ${IMAGE_ALLOWED_TYPES.join(', ')}` },
+        )
+        .describe(`MIME type of the image, one of: ${IMAGE_ALLOWED_TYPES.join(', ')}.`),
+      contentBase64: z.string().min(1).describe('Base64-encoded image bytes.'),
+    }),
+    annotations: { destructiveHint: false, idempotentHint: false },
+    async handler(event, args) {
+      const R2 = requireR2Bucket(event.context.cloudflare.env)
+      const bytes = decodeBase64Image(args.contentBase64)
+
+      if (bytes.byteLength > IMAGE_MAX_SIZE) {
+        throw createError({ status: 400, statusText: 'File size exceeds 5MB limit' })
+      }
+
+      const ext = args.contentType.split('/')[1]
+      const key = `images/${args.slug}/${nanoid(10)()}.${ext}`
+
+      await R2.put(key, bytes, {
+        httpMetadata: {
+          contentType: args.contentType,
+        },
+      })
+
+      return { url: `/_assets/${key}`, key, filename: args.filename }
+    },
+  }),
+  defineTool({
+    name: 'backup_links',
+    description: 'Write a full snapshot of every stored link to R2 and report completion. Requires the R2 binding, and fails while the one-time KV-to-D1 link migration is still pending.',
+    inputSchema: z.object({}),
+    annotations: { destructiveHint: false, idempotentHint: true },
+    async handler(event) {
+      const env = event.context.cloudflare.env
+      const result = await backupLinksToR2(env, true)
+      if (!result.completed && result.reason === 'migration-incomplete')
+        throw createError({ status: 423, statusText: 'Link migration is required' })
+      if (!result.completed)
+        requireR2Bucket(env)
+
+      return {
+        success: true,
+        message: 'Backup completed successfully',
+      }
+    },
+  }),
+  defineTool({
+    name: 'migration_status',
+    description: 'Report whether the one-time KV-to-D1 link migration has completed. Every link tool refuses with 423 until it has, so call this first when those fail.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true },
+    async handler(event) {
+      const marker = await readCompletedLinkMigrationMarker(event.context.cloudflare.env)
+      return {
+        completed: marker !== null,
+        marker,
+      }
+    },
+  }),
+  defineTool({
+    name: 'verify',
+    description: 'Report which credential this connection is using and which identity it resolves to. Useful as a cheap connectivity check before a longer sequence of calls.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true },
+    async handler(event) {
+      return buildVerificationResponse(event)
+    },
+  }),
+]
+
 const linkToolNames = new Set(linkTools.map(tool => tool.name))
 
 /** Explicit 4xx business errors reach the model verbatim; anything else is logged once and reported generically. */
@@ -217,7 +368,7 @@ function toolErrorText(toolName: string, error: unknown): string {
  * `isError` so the calling model can self-correct.
  */
 export function registerMcpTools(server: McpServer, event: H3Event): void {
-  for (const tool of [...linkTools, ...analyticsTools]) {
+  for (const tool of [...linkTools, ...analyticsTools, ...utilityTools]) {
     server.registerTool(tool.name, {
       // Titles are the display form of the name (`list_links` → `List links`),
       // and annotations fall back to the hints every Sink tool shares.

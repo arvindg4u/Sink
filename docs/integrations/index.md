@@ -55,10 +55,18 @@ Any client that supports an HTTP transport with custom headers can connect the s
 | `upsert_link`            | Return the existing link for a slug, or create it.    |
 | `delete_link`            | Permanently delete a link.                            |
 | `check_links`            | Check stored link targets, paginated by slug.         |
+| `import_links`           | Import links from an export payload, skipping slugs.  |
+| `export_links`           | Export stored links page by page, passwords masked.   |
 | `get_analytics_counters` | Total visits, visitors, and referers.                 |
 | `get_analytics_views`    | Visits and visitors bucketed by minute, hour, or day. |
 | `get_analytics_metrics`  | Top values for one access-log dimension.              |
 | `get_analytics_heatmap`  | Visits and visitors by weekday and hour of day.       |
+| `generate_slug`          | Ask Workers AI for a slug derived from a page.        |
+| `generate_og_metadata`   | Ask Workers AI for preview title and description.     |
+| `upload_image`           | Store a base64 image in R2 and return its asset URL.  |
+| `backup_links`           | Snapshot every stored link to R2.                     |
+| `migration_status`       | Report whether the KV-to-D1 migration completed.      |
+| `verify`                 | Report the identity behind the current credentials.   |
 
 The write tools honor `NUXT_PUBLIC_PREVIEW_MODE` and the KV-to-D1 migration gate exactly as the REST API does, and analytics tools read the same sampled access log as the dashboard, so their counts are estimates. For `update_link`, sending an empty `password` clears protection while omitting it keeps the stored one.
 
